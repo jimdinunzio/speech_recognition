@@ -544,13 +544,16 @@ class Recognizer(AudioSource):
         frames.close()
         return AudioData(frame_data, source.SAMPLE_RATE, source.SAMPLE_WIDTH)
 
-    def adjust_for_ambient_noise(self, source, duration=1):
+    def adjust_for_ambient_noise(self, source, duration=1, is_speech_cb=None):
         """
         Adjusts the energy threshold dynamically using audio from ``source`` (an ``AudioSource`` instance) to account for ambient noise.
 
         Intended to calibrate the energy threshold with the ambient energy level. Should be used on periods of audio without speech - will stop early if any speech is detected.
 
         The ``duration`` parameter is the maximum number of seconds that it will dynamically adjust the threshold for before returning. This value should be at least 0.5 in order to get a representative sample of the ambient noise.
+        
+        The ``is_speech_cb`` parameter is a function that returns whether speech is detected through some other means such as microphone array hardware
+
         """
         assert isinstance(source, AudioSource), "Source must be an audio source"
         assert source.stream is not None, "Audio source must be entered before adjusting, see documentation for ``AudioSource``; are you using ``source`` outside of a ``with`` statement?"
@@ -565,11 +568,20 @@ class Recognizer(AudioSource):
             if elapsed_time > duration: break
             buffer = source.stream.read(source.CHUNK)
             energy = audioop.rms(buffer, source.SAMPLE_WIDTH)  # energy of the audio signal
+            
+            # if energy jumped suddenly then consider that speech and abort this sampling
+            if is_speech_cb is not None and is_speech_cb() and energy > self.energy_threshold:
+                return
 
             # dynamically adjust the energy threshold using asymmetric weighted average
+            
             damping = self.dynamic_energy_adjustment_damping ** seconds_per_buffer  # account for different chunk sizes and rates
             target_energy = energy * self.dynamic_energy_ratio
-            self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)
+            if is_speech_cb is not None:
+                if not is_speech_cb():
+                    self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)
+            else:
+                self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)    
 
     def snowboy_wait_for_hot_word(self, snowboy_location, snowboy_hot_word_files, source, timeout=None):
         # load snowboy library (NOT THREAD SAFE)
@@ -620,7 +632,7 @@ class Recognizer(AudioSource):
 
         return b"".join(frames), elapsed_time
 
-    def listen(self, source, timeout=None, phrase_time_limit=None, snowboy_configuration=None):
+    def listen(self, source, timeout=None, phrase_time_limit=None, snowboy_configuration=None, is_speech_cb=None):
         """
         Records a single phrase from ``source`` (an ``AudioSource`` instance) into an ``AudioData`` instance, which it returns.
 
@@ -631,6 +643,8 @@ class Recognizer(AudioSource):
         The ``phrase_time_limit`` parameter is the maximum number of seconds that this will allow a phrase to continue before stopping and returning the part of the phrase processed before the time limit was reached. The resulting audio will be the phrase cut off at the time limit. If ``phrase_timeout`` is ``None``, there will be no phrase time limit.
 
         The ``snowboy_configuration`` parameter allows integration with `Snowboy <https://snowboy.kitt.ai/>`__, an offline, high-accuracy, power-efficient hotword recognition engine. When used, this function will pause until Snowboy detects a hotword, after which it will unpause. This parameter should either be ``None`` to turn off Snowboy support, or a tuple of the form ``(SNOWBOY_LOCATION, LIST_OF_HOT_WORD_FILES)``, where ``SNOWBOY_LOCATION`` is the path to the Snowboy root directory, and ``LIST_OF_HOT_WORD_FILES`` is a list of paths to Snowboy hotword configuration files (`*.pmdl` or `*.umdl` format).
+
+        The ``is_speech_cb`` parameter is a function that returns whether speech is detected through some other means such as microphone array hardware
 
         This operation will always complete within ``timeout + phrase_timeout`` seconds if both are numbers, either by returning the audio data, or by raising a ``speech_recognition.WaitTimeoutError`` exception.
         """
@@ -655,6 +669,7 @@ class Recognizer(AudioSource):
 
             if snowboy_configuration is None:
                 # store audio input until the phrase starts
+                #time_to_print = time.monotonic()
                 while True:
                     # handle waiting too long for phrase by raising an exception
                     elapsed_time += seconds_per_buffer
@@ -669,13 +684,18 @@ class Recognizer(AudioSource):
 
                     # detect whether speaking has started on audio input
                     energy = audioop.rms(buffer, source.SAMPLE_WIDTH)  # energy of the audio signal
-                    if energy > self.energy_threshold: break
+                    if energy > self.energy_threshold and is_speech_cb is not None and is_speech_cb():
+                        #print("energy exceeded threshold", energy, " and speech detected during listening")
+                        break
 
                     # dynamically adjust the energy threshold using asymmetric weighted average
-                    if self.dynamic_energy_threshold:
+                    if self.dynamic_energy_threshold and is_speech_cb and not is_speech_cb():
                         damping = self.dynamic_energy_adjustment_damping ** seconds_per_buffer  # account for different chunk sizes and rates
                         target_energy = energy * self.dynamic_energy_ratio
-                        self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)
+                        self.energy_threshold = max(300, self.energy_threshold * damping + target_energy * (1 - damping))
+                        # if time.monotonic() - time_to_print > 1:
+                        #     print("setting energy_threshold to ", self.energy_threshold)
+                        #     time_to_print = time.monotonic()
             else:
                 # read audio input until the hotword is said
                 snowboy_location, snowboy_hot_word_files = snowboy_configuration
