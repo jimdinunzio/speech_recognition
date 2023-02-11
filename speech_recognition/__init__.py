@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 import wave
+import struct
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -33,6 +34,7 @@ from .exceptions import (
     UnknownValueError,
     WaitTimeoutError,
 )
+from typing import Sequence, Callable
 
 __author__ = "Anthony Zhang (Uberi)"
 __version__ = "3.14.3"
@@ -325,6 +327,7 @@ class Recognizer(AudioSource):
         self.dynamic_energy_adjustment_damping = 0.15
         self.dynamic_energy_ratio = 1.5
         self.pause_threshold = 0.8  # seconds of non-speaking audio before a phrase is considered complete
+        self.pause_after_wake_word = 3.0  # seconds of silence after a wake word is detected before the recognizer stops listening for more audio
         self.operation_timeout = None  # seconds after an internal operation (e.g., an API request) starts before it times out, or ``None`` for no timeout
 
         self.phrase_threshold = 0.3  # minimum seconds of speaking audio before we consider the speaking audio a phrase - values below this are ignored (for filtering out clicks and pops)
@@ -402,56 +405,72 @@ class Recognizer(AudioSource):
             else:
                 self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)    
 
-    def snowboy_wait_for_hot_word(self, snowboy_location, snowboy_hot_word_files, source, timeout=None):
-        # load snowboy library (NOT THREAD SAFE)
-        sys.path.append(snowboy_location)
-        import snowboydetect
-        sys.path.pop()
+    class PorcupineListener:
+        class Config:
+            """
+            A Config is used to configure the PorcupineListener
 
-        detector = snowboydetect.SnowboyDetect(
-            resource_filename=os.path.join(snowboy_location, "resources", "common.res").encode(),
-            model_str=",".join(snowboy_hot_word_files).encode()
-        )
-        detector.SetAudioGain(1.0)
-        detector.SetSensitivity(",".join(["0.4"] * len(snowboy_hot_word_files)).encode())
-        snowboy_sample_rate = detector.SampleRate()
+            ``access_key`` is the Picovoice AccessKey obtained from the Picovoice Console (https://console.picovoice.ai/).
 
-        elapsed_time = 0
-        seconds_per_buffer = float(source.CHUNK) / source.SAMPLE_RATE
-        resampling_state = None
+            ``keyword_paths`` is the sequence of paths to the .ppn keyword files.
+                        
+            ``sensitivities`` is the sequence of floats from 0.0 to 1.0 for how sensitive keyword detection should be.
 
-        # buffers capable of holding 5 seconds of original audio
-        five_seconds_buffer_count = int(math.ceil(5 / seconds_per_buffer))
-        # buffers capable of holding 0.5 seconds of resampled audio
-        half_second_buffer_count = int(math.ceil(0.5 / seconds_per_buffer))
-        frames = collections.deque(maxlen=five_seconds_buffer_count)
-        resampled_frames = collections.deque(maxlen=half_second_buffer_count)
-        # snowboy check interval
-        check_interval = 0.05
-        last_check = time.time()
-        while True:
-            elapsed_time += seconds_per_buffer
-            if timeout and elapsed_time > timeout:
-                raise WaitTimeoutError("listening timed out while waiting for hotword to be said")
+            ``on_detection`` is a callback function that is called when a keyword is detected. It takes in the index of the detected keyword as its only argument.
+            """
+            def __init__(
+                self,
+                access_key: str,
+                keyword_paths: Sequence[str],
+                sensitivities: Sequence[float],
+                on_detection: Callable[[int], None] = lambda x: None
+            ):
+                self.access_key = access_key
+                self.keyword_paths = keyword_paths
+                self.sensitivities = sensitivities
+                self.on_detection = on_detection
 
-            buffer = source.stream.read(source.CHUNK)
-            if len(buffer) == 0: break  # reached end of the stream
-            frames.append(buffer)
+        def __init__(self, source, config:Config):
+            import pvporcupine
+            self.listener = pvporcupine.create(
+                access_key=config.access_key,
+                keyword_paths=config.keyword_paths,
+                sensitivities=config.sensitivities
+            )
+            self.elapsed_time = 0
+            self.seconds_per_buffer = float(source.CHUNK) / source.SAMPLE_RATE
+            self.source = source
+            self.on_detection = config.on_detection
 
-            # resample audio to the required sample rate
-            resampled_buffer, resampling_state = audioop.ratecv(buffer, source.SAMPLE_WIDTH, 1, source.SAMPLE_RATE, snowboy_sample_rate, resampling_state)
-            resampled_frames.append(resampled_buffer)
-            if time.time() - last_check > check_interval:
-                # run Snowboy on the resampled audio
-                snowboy_result = detector.RunDetection(b"".join(resampled_frames))
-                assert snowboy_result != -1, "Error initializing streams or reading audio data"
-                if snowboy_result > 0: break  # wake word found
-                resampled_frames.clear()
-                last_check = time.time()
+        def __del__(self):
+            self.listener.delete()
 
-        return b"".join(frames), elapsed_time
+        def get_prediction(self, chunk):
+            self.elapsed_time += self.seconds_per_buffer
+            chunk_int16 = struct.unpack_from("h" * self.source.CHUNK, chunk) # convert bytes to int16 array
+            return self.listener.process(chunk_int16)
 
-    def listen(self, source, timeout=None, phrase_time_limit=None, snowboy_configuration=None, stream=False, is_speech_cb=None):
+        def wait_for_hot_word(self, timeout=None):
+            """
+            The ``timeout`` parameter is the number of seconds after which waiting is aborted.
+            """
+            self.elapsed_time = 0
+
+            #print("listening for wake word")
+            try:
+                while True:
+                    if timeout and self.elapsed_time > timeout:
+                        raise WaitTimeoutError("listening timed out while waiting for hotword to be said")
+                    result = self.get_prediction(self.source.stream.read(self.source.CHUNK))
+                    if result >= 0:
+                        print("Wake word #{} detected".format(result))
+                        self.on_detection(result)
+                        break
+            except:
+                raise
+            return result
+
+    def listen(self, source, timeout=None, phrase_time_limit=None, porcupine_config : PorcupineListener.Config=None, stream=False, is_speech_cb=None):
         """
         Records a single phrase from ``source`` (an ``AudioSource`` instance) into an ``AudioData`` instance, which it returns.
 
@@ -463,26 +482,27 @@ class Recognizer(AudioSource):
 
         The ``phrase_time_limit`` parameter is the maximum number of seconds that this will allow a phrase to continue before stopping and returning the part of the phrase processed before the time limit was reached. The resulting audio will be the phrase cut off at the time limit. If ``phrase_timeout`` is ``None``, there will be no phrase time limit.
 
-        The ``snowboy_configuration`` parameter allows integration with `Snowboy <https://snowboy.kitt.ai/>`__, an offline, high-accuracy, power-efficient hotword recognition engine. When used, this function will pause until Snowboy detects a hotword, after which it will unpause. This parameter should either be ``None`` to turn off Snowboy support, or a tuple of the form ``(SNOWBOY_LOCATION, LIST_OF_HOT_WORD_FILES)``, where ``SNOWBOY_LOCATION`` is the path to the Snowboy root directory, and ``LIST_OF_HOT_WORD_FILES`` is a list of paths to Snowboy hotword configuration files (`*.pmdl` or `*.umdl` format).
+        The ``porcupine_config`` parameter allows integration with `Porcupine https://picovoice.ai/docs/quick-start/porcupine-python/`, an offline, high-accuracy, power-efficient hotword recognition engine. When used, this function will pause until Porcupine detects a hotword, after which it will unpause. This parameter should either be ``None`` to turn off Porcupine support, or an instance of the class PorcupineConfig.
 
         The ``is_speech_cb`` parameter is a function that returns whether speech is detected through some other means such as microphone array hardware
 
         This operation will always complete within ``timeout + phrase_timeout`` seconds if both are numbers, either by returning the audio data, or by raising a ``speech_recognition.WaitTimeoutError`` exception.
         """
-        result = self._listen(source, timeout, phrase_time_limit, snowboy_configuration, stream, is_speech_cb)
+        result = self._listen(source, timeout, phrase_time_limit, porcupine_config, stream, is_speech_cb)
         if not stream:
             for a in result:
                 return a
         return result
 
-    def _listen(self, source, timeout=None, phrase_time_limit=None, snowboy_configuration=None, stream=False, is_speech_cb=None):
+    def _listen(self, source, timeout=None, phrase_time_limit=None, porcupine_config : PorcupineListener.Config=None, stream=False, is_speech_cb=None):
         assert isinstance(source, AudioSource), "Source must be an audio source"
         assert source.stream is not None, "Audio source must be entered before listening, see documentation for ``AudioSource``; are you using ``source`` outside of a ``with`` statement?"
         assert self.pause_threshold >= self.non_speaking_duration >= 0
-        if snowboy_configuration is not None:
-            assert os.path.isfile(os.path.join(snowboy_configuration[0], "snowboydetect.py")), "``snowboy_configuration[0]`` must be a Snowboy root directory containing ``snowboydetect.py``"
-            for hot_word_file in snowboy_configuration[1]:
-                assert os.path.isfile(hot_word_file), "``snowboy_configuration[1]`` must be a list of Snowboy hot word configuration files"
+        if porcupine_config is not None:
+            assert os.path.isfile(porcupine_config.keyword_paths[0]), "``porcupine_config.keyword_paths[0]`` must contain a path to a valid Porcupine keyword file"
+            self.porcupine_listener = self.PorcupineListener(source, porcupine_config)
+        else:
+            self.porcupine_listener = None
 
         seconds_per_buffer = float(source.CHUNK) / source.SAMPLE_RATE
         pause_buffer_count = int(math.ceil(self.pause_threshold / seconds_per_buffer))  # number of buffers of non-speaking audio during a phrase, before the phrase should be considered complete
@@ -492,10 +512,11 @@ class Recognizer(AudioSource):
         # read audio input for phrases until there is a phrase that is long enough
         elapsed_time = 0  # number of seconds of audio read
         buffer = b""  # an empty buffer means that the stream has ended and there is no data left to read
+
         while True:
             frames = collections.deque()
 
-            if snowboy_configuration is None:
+            if self.porcupine_listener is None:
                 # store audio input until the phrase starts
                 #time_to_print = time.monotonic()
                 while True:
@@ -525,12 +546,10 @@ class Recognizer(AudioSource):
                         #     print("setting energy_threshold to ", self.energy_threshold)
                         #     time_to_print = time.monotonic()
             else:
-                # read audio input until the hotword is said
-                snowboy_location, snowboy_hot_word_files = snowboy_configuration
-                buffer, delta_time = self.snowboy_wait_for_hot_word(snowboy_location, snowboy_hot_word_files, source, timeout)
-                elapsed_time += delta_time
-                if len(buffer) == 0: break  # reached end of the stream
-                frames.append(buffer)
+                # read audio input until the wake word is said
+                index = self.porcupine_listener.wait_for_hot_word(timeout)
+                if index < 0:
+                    raise WaitTimeoutError("listening timed out while waiting for wake word to be said")
 
             # read audio input until the phrase ends
             pause_count, phrase_count = 0, 0
@@ -564,6 +583,11 @@ class Recognizer(AudioSource):
                         pause_count = 0
                     else:
                         pause_count += 1
+                
+                # wait a specified amount of time after the wake word is detected for user to continue speaking before stopping reseting
+                if self.porcupine_listener is not None and elapsed_time - phrase_start_time < self.pause_after_wake_word:
+                    continue
+
                 if pause_count > pause_buffer_count:  # end of the phrase
                     break
 
@@ -579,7 +603,11 @@ class Recognizer(AudioSource):
 
             # check how long the detected phrase is, and retry listening if the phrase is too short
             phrase_count -= pause_count  # exclude the buffers for the pause before the phrase
-            if phrase_count >= phrase_buffer_count or len(buffer) == 0: break  # phrase is long enough or we've reached the end of the stream, so stop listening
+            if phrase_count >= phrase_buffer_count or len(buffer) == 0:
+                break  # phrase is long enough or we've reached the end of the stream, so stop listening
+            else:
+                if self.porcupine_listener is not None:
+                    self.porcupine_listener.on_detection(-1) # tell caller that detection was reset.
 
         if stream:
             # yield the last buffer of the phrase.
@@ -1272,6 +1300,15 @@ class Recognizer(AudioSource):
                 human_string = self.tflabels[node_id]
                 return human_string
 
+    def prime_vosk(self):
+        """
+        Primes the vosk recognizer by calling recognize_vosk with short clip of silence.
+        This method should be called before using `recognize_vosk`.
+        """
+        pcm = b'\x00' * 4000 * 2
+        audio_data = AudioData(pcm, 16000, 2)
+        self.recognize_vosk(audio_data, language='en', arg2=None, alts=1)
+
     def recognize_vosk(self, audio_data, language='en', arg2=None, alts=1):
         from vosk import KaldiRecognizer, Model
 
@@ -1283,14 +1320,15 @@ class Recognizer(AudioSource):
                 exit(1)
             self.vosk_model = Model("model")
 
-        if arg2 is None:
-            rec = KaldiRecognizer(self.vosk_model, 16000)
-        else:
-            rec = KaldiRecognizer(self.vosk_model, 16000, arg2)
+        if not hasattr(self, "rec"):
+            if arg2 is None:
+                self.rec = KaldiRecognizer(self.vosk_model, 16000)
+            else:
+                self.rec = KaldiRecognizer(self.vosk_model, 16000, arg2)
         
-        rec.SetMaxAlternatives(alts)
-        rec.AcceptWaveform(audio_data.get_raw_data(convert_rate=16000, convert_width=2))
-        result = rec.Result()
+        self.rec.SetMaxAlternatives(alts)
+        self.rec.AcceptWaveform(audio_data.get_raw_data(convert_rate=16000, convert_width=2))
+        result = self.rec.FinalResult()
 
         return result
 
