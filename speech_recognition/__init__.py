@@ -507,6 +507,7 @@ class Recognizer(AudioSource):
         self.dynamic_energy_ratio = 1.5
         self.pause_threshold = 0.8  # seconds of non-speaking audio before a phrase is considered complete
         self.operation_timeout = None  # seconds after an internal operation (e.g., an API request) starts before it times out, or ``None`` for no timeout
+        self.precise_listener = None
 
         self.phrase_threshold = 0.3  # minimum seconds of speaking audio before we consider the speaking audio a phrase - values below this are ignored (for filtering out clicks and pops)
         self.non_speaking_duration = 0.5  # seconds of non-speaking audio to keep on both sides of the recording
@@ -581,58 +582,78 @@ class Recognizer(AudioSource):
                 if not is_speech_cb():
                     self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)
             else:
-                self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)    
+                self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)
 
-    def snowboy_wait_for_hot_word(self, snowboy_location, snowboy_hot_word_files, source, timeout=None):
-        # load snowboy library (NOT THREAD SAFE)
-        sys.path.append(snowboy_location)
-        import snowboydetect
-        sys.path.pop()
 
-        detector = snowboydetect.SnowboyDetect(
-            resource_filename=os.path.join(snowboy_location, "resources", "common.res").encode(),
-            model_str=",".join(snowboy_hot_word_files).encode()
-        )
-        detector.SetAudioGain(1.0)
-        detector.SetSensitivity(",".join(["0.4"] * len(snowboy_hot_word_files)).encode())
-        snowboy_sample_rate = detector.SampleRate()
+    class PreciseListener:
+        class Config:
+            """
+            A Config is used to configure the PreciseListener
 
-        elapsed_time = 0
-        seconds_per_buffer = float(source.CHUNK) / source.SAMPLE_RATE
-        resampling_state = None
+            ``model_file_path`` is the path to the .pb or .net file
+            
+            ``trigger_level`` is the number of chunk activations needed to trigger an activation
+            
+            ``sensitivity`` is a float from 0.0 to 1.0 how sensitive the network should be.
 
-        # buffers capable of holding 5 seconds of original audio
-        five_seconds_buffer_count = int(math.ceil(5 / seconds_per_buffer))
-        # buffers capable of holding 0.5 seconds of resampled audio
-        half_second_buffer_count = int(math.ceil(0.5 / seconds_per_buffer))
-        frames = collections.deque(maxlen=five_seconds_buffer_count)
-        resampled_frames = collections.deque(maxlen=half_second_buffer_count)
-        # snowboy check interval
-        check_interval = 0.05
-        last_check = time.time()
-        while True:
-            elapsed_time += seconds_per_buffer
-            if timeout and elapsed_time > timeout:
-                raise WaitTimeoutError("listening timed out while waiting for hotword to be said")
+            ``on_prediction`` is a function that takes a float, confidence level
+            """
+            def __init__(self, model_file_path, trigger_level=3, sensitivity=0.5, on_prediction=lambda x: None):                
+                self.model_file_path = model_file_path
+                self.trigger_level = trigger_level
+                self.sensitivity = sensitivity
+                self.on_prediction = on_prediction
 
-            buffer = source.stream.read(source.CHUNK)
-            if len(buffer) == 0: break  # reached end of the stream
-            frames.append(buffer)
+        def __init__(self, source, config:Config):
+            from precise_runner import PreciseRunner
+            from precise_runner.runner import ListenerEngine
+            from precise.network_runner import Listener
 
-            # resample audio to the required sample rate
-            resampled_buffer, resampling_state = audioop.ratecv(buffer, source.SAMPLE_WIDTH, 1, source.SAMPLE_RATE, snowboy_sample_rate, resampling_state)
-            resampled_frames.append(resampled_buffer)
-            if time.time() - last_check > check_interval:
-                # run Snowboy on the resampled audio
-                snowboy_result = detector.RunDetection(b"".join(resampled_frames))
-                assert snowboy_result != -1, "Error initializing streams or reading audio data"
-                if snowboy_result > 0: break  # wake word found
-                resampled_frames.clear()
-                last_check = time.time()
+            self.activated = False
+            self.frames = None
+            self.listener = Listener(os.path.join(os.path.abspath(config.model_file_path)), source.CHUNK)
+            engine = ListenerEngine(self.listener, source.CHUNK)
+            engine.get_prediction = self.get_prediction
+            self.runner = PreciseRunner(engine, trigger_level=config.trigger_level, sensitivity=config.sensitivity, stream=source.stream, 
+                                    on_activation=self.on_activation, on_prediction=config.on_prediction)  
+        def on_activation(self):
+            print("Wake word heard")
+            self.activated=True
 
-        return b"".join(frames), elapsed_time
+        def get_prediction(self, chunk):
+            self.frames.append(chunk)
+            return self.listener.update(chunk)
 
-    def listen(self, source, timeout=None, phrase_time_limit=None, snowboy_configuration=None, is_speech_cb=None):
+        def wait_for_hot_word(self, source, timeout=None):
+            """
+            The ``source`` parameter is the input audio source.
+
+            The ``timeout`` parameter is the number of seconds after which waiting is aborted.
+            """
+            elapsed_time = 0
+            seconds_per_buffer = float(source.CHUNK) / source.SAMPLE_RATE
+
+            # buffers capable of holding 5 seconds of original audio
+            five_seconds_buffer_count = int(math.ceil(5 / seconds_per_buffer))
+            self.frames = collections.deque(maxlen=five_seconds_buffer_count)
+
+            self.activated = False
+            self.runner.start()
+
+            #print("listening for wake word")
+            try:
+                while not self.activated:
+                    elapsed_time += seconds_per_buffer
+                    if timeout and elapsed_time > timeout:
+                        raise WaitTimeoutError("listening timed out while waiting for hotword to be said")
+                    time.sleep(0.05)
+            except:
+                raise
+            finally:
+                self.runner.stop()
+            return b"".join(self.frames), elapsed_time
+
+    def listen(self, source, timeout=None, phrase_time_limit=None, mycroft_precise_config : PreciseListener.Config=None, is_speech_cb=None):
         """
         Records a single phrase from ``source`` (an ``AudioSource`` instance) into an ``AudioData`` instance, which it returns.
 
@@ -642,7 +663,7 @@ class Recognizer(AudioSource):
 
         The ``phrase_time_limit`` parameter is the maximum number of seconds that this will allow a phrase to continue before stopping and returning the part of the phrase processed before the time limit was reached. The resulting audio will be the phrase cut off at the time limit. If ``phrase_timeout`` is ``None``, there will be no phrase time limit.
 
-        The ``snowboy_configuration`` parameter allows integration with `Snowboy <https://snowboy.kitt.ai/>`__, an offline, high-accuracy, power-efficient hotword recognition engine. When used, this function will pause until Snowboy detects a hotword, after which it will unpause. This parameter should either be ``None`` to turn off Snowboy support, or a tuple of the form ``(SNOWBOY_LOCATION, LIST_OF_HOT_WORD_FILES)``, where ``SNOWBOY_LOCATION`` is the path to the Snowboy root directory, and ``LIST_OF_HOT_WORD_FILES`` is a list of paths to Snowboy hotword configuration files (`*.pmdl` or `*.umdl` format).
+        The ``mycroft_precise_config`` parameter allows integration with `Mycroft Precise <https://mycroft-ai.gitbook.io/docs/mycroft-technologies/precise>` a Wake Word Listener based on a neural network that is trained on sound patterns. When used, this function will pause until Precise detects a hotword, after which it will unpause. This parameter should either be ``None`` to turn off Precise support an instance of the class PreciseConfig.
 
         The ``is_speech_cb`` parameter is a function that returns whether speech is detected through some other means such as microphone array hardware
 
@@ -651,10 +672,9 @@ class Recognizer(AudioSource):
         assert isinstance(source, AudioSource), "Source must be an audio source"
         assert source.stream is not None, "Audio source must be entered before listening, see documentation for ``AudioSource``; are you using ``source`` outside of a ``with`` statement?"
         assert self.pause_threshold >= self.non_speaking_duration >= 0
-        if snowboy_configuration is not None:
-            assert os.path.isfile(os.path.join(snowboy_configuration[0], "snowboydetect.py")), "``snowboy_configuration[0]`` must be a Snowboy root directory containing ``snowboydetect.py``"
-            for hot_word_file in snowboy_configuration[1]:
-                assert os.path.isfile(hot_word_file), "``snowboy_configuration[1]`` must be a list of Snowboy hot word configuration files"
+        if mycroft_precise_config is not None:
+            assert os.path.isfile(mycroft_precise_config.model_file_path), "``mycroft_precise_config.model_path`` must contain a path to a Mycroft Precise model file."
+            self.precise_listener = self.PreciseListener(source, mycroft_precise_config)
 
         seconds_per_buffer = float(source.CHUNK) / source.SAMPLE_RATE
         pause_buffer_count = int(math.ceil(self.pause_threshold / seconds_per_buffer))  # number of buffers of non-speaking audio during a phrase, before the phrase should be considered complete
@@ -667,7 +687,7 @@ class Recognizer(AudioSource):
         while True:
             frames = collections.deque()
 
-            if snowboy_configuration is None:
+            if self.precise_listener is None:
                 # store audio input until the phrase starts
                 #time_to_print = time.monotonic()
                 while True:
@@ -698,9 +718,9 @@ class Recognizer(AudioSource):
                         #     time_to_print = time.monotonic()
             else:
                 # read audio input until the hotword is said
-                snowboy_location, snowboy_hot_word_files = snowboy_configuration
-                buffer, delta_time = self.snowboy_wait_for_hot_word(snowboy_location, snowboy_hot_word_files, source, timeout)
+                buffer, delta_time = self.precise_listener.wait_for_hot_word(source, timeout)
                 elapsed_time += delta_time
+                print("wake word delta time = ", delta_time)
                 if len(buffer) == 0: break  # reached end of the stream
                 frames.append(buffer)
 
@@ -1411,7 +1431,7 @@ class Recognizer(AudioSource):
                 human_string = self.tflabels[node_id]
                 return human_string
             
-    def recognize_vosk(self, audio_data, language='en'):
+    def recognize_vosk(self, audio_data, language='en', arg2=None, alts=1):
         from vosk import Model, KaldiRecognizer
         
         assert isinstance(audio_data, AudioData), "Data must be audio data"
@@ -1422,12 +1442,17 @@ class Recognizer(AudioSource):
                 exit (1)
             self.vosk_model = Model("model")
 
-        rec = KaldiRecognizer(self.vosk_model, 16000);
+        if arg2 is None:
+            rec = KaldiRecognizer(self.vosk_model, 16000)
+        else:
+            rec = KaldiRecognizer(self.vosk_model, 16000, arg2)
         
+        rec.SetMaxAlternatives(alts)
         rec.AcceptWaveform(audio_data.get_raw_data(convert_rate=16000, convert_width=2));
-        finalRecognition = rec.FinalResult()
+        result = rec.Result()
+        #finalRecognition = rec.FinalResult()
         
-        return finalRecognition
+        return result
 
 def get_flac_converter():
     """Returns the absolute path of a FLAC converter executable, or raises an OSError if none can be found."""
