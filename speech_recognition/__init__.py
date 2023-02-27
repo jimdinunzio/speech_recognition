@@ -738,12 +738,18 @@ class Recognizer(AudioSource):
                 frames.append(buffer)
                 phrase_count += 1
 
-                # check if speaking has stopped for longer than the pause threshold on the audio input
-                energy = audioop.rms(buffer, source.SAMPLE_WIDTH)  # unit energy of the audio signal within the buffer
-                if energy > self.energy_threshold:
-                    pause_count = 0
+                if is_speech_cb:
+                    if is_speech_cb():
+                        pause_count = 0
+                    else:
+                        pause_count += 1
                 else:
-                    pause_count += 1
+                    # check if speaking has stopped for longer than the pause threshold on the audio input
+                    energy = audioop.rms(buffer, source.SAMPLE_WIDTH)  # unit energy of the audio signal within the buffer
+                    if energy > self.energy_threshold:
+                        pause_count = 0
+                    else:
+                        pause_count += 1
                 if pause_count > pause_buffer_count:  # end of the phrase
                     break
 
