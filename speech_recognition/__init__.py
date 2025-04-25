@@ -609,6 +609,8 @@ class Recognizer(AudioSource):
             from precise_runner.runner import ListenerEngine
             from precise.network_runner import Listener
 
+            self.elapsed_time = 0
+            self.seconds_per_buffer = float(source.CHUNK) / source.SAMPLE_RATE
             self.activated = False
             self.frames = None
             self.listener = Listener(os.path.join(os.path.abspath(config.model_file_path)), source.CHUNK)
@@ -622,19 +624,19 @@ class Recognizer(AudioSource):
 
         def get_prediction(self, chunk):
             self.frames.append(chunk)
+            self.elapsed_time += self.seconds_per_buffer
             return self.listener.update(chunk)
 
-        def wait_for_hot_word(self, source, timeout=None):
+        def wait_for_hot_word(self, timeout=None):
             """
             The ``source`` parameter is the input audio source.
 
             The ``timeout`` parameter is the number of seconds after which waiting is aborted.
             """
-            elapsed_time = 0
-            seconds_per_buffer = float(source.CHUNK) / source.SAMPLE_RATE
+            self.elapsed_time = 0
 
             # buffers capable of holding 5 seconds of original audio
-            five_seconds_buffer_count = int(math.ceil(5 / seconds_per_buffer))
+            five_seconds_buffer_count = int(math.ceil(5 / self.seconds_per_buffer))
             self.frames = collections.deque(maxlen=five_seconds_buffer_count)
 
             self.activated = False
@@ -643,15 +645,14 @@ class Recognizer(AudioSource):
             #print("listening for wake word")
             try:
                 while not self.activated:
-                    elapsed_time += seconds_per_buffer
-                    if timeout and elapsed_time > timeout:
+                    if timeout and self.elapsed_time > timeout:
                         raise WaitTimeoutError("listening timed out while waiting for hotword to be said")
                     time.sleep(0.05)
             except:
                 raise
             finally:
                 self.runner.stop()
-            return b"".join(self.frames), elapsed_time
+            return b"".join(self.frames), self.elapsed_time
 
     def listen(self, source, timeout=None, phrase_time_limit=None, mycroft_precise_config : PreciseListener.Config=None, is_speech_cb=None):
         """
@@ -675,6 +676,8 @@ class Recognizer(AudioSource):
         if mycroft_precise_config is not None:
             assert os.path.isfile(mycroft_precise_config.model_file_path), "``mycroft_precise_config.model_path`` must contain a path to a Mycroft Precise model file."
             self.precise_listener = self.PreciseListener(source, mycroft_precise_config)
+        else:
+            self.precise_listener = None
 
         seconds_per_buffer = float(source.CHUNK) / source.SAMPLE_RATE
         pause_buffer_count = int(math.ceil(self.pause_threshold / seconds_per_buffer))  # number of buffers of non-speaking audio during a phrase, before the phrase should be considered complete
@@ -718,9 +721,9 @@ class Recognizer(AudioSource):
                         #     time_to_print = time.monotonic()
             else:
                 # read audio input until the hotword is said
-                buffer, delta_time = self.precise_listener.wait_for_hot_word(source, timeout)
+                buffer, delta_time = self.precise_listener.wait_for_hot_word(timeout)
                 elapsed_time += delta_time
-                print("wake word delta time = ", delta_time)
+                print(f"wake word delta time = {delta_time}, elapsed time = {elapsed_time}")
                 if len(buffer) == 0: break  # reached end of the stream
                 frames.append(buffer)
 
