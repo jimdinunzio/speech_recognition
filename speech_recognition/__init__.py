@@ -1266,7 +1266,7 @@ class Recognizer(AudioSource):
                 human_string = self.tflabels[node_id]
                 return human_string
 
-    def recognize_vosk(self, audio_data, language='en'):
+    def recognize_vosk(self, audio_data, language='en', arg2=None, alts=1):
         from vosk import KaldiRecognizer, Model
 
         assert isinstance(audio_data, AudioData), "Data must be audio data"
@@ -1277,13 +1277,16 @@ class Recognizer(AudioSource):
                 exit(1)
             self.vosk_model = Model("model")
 
-        rec = KaldiRecognizer(self.vosk_model, 16000)
-
+        if arg2 is None:
+            rec = KaldiRecognizer(self.vosk_model, 16000)
+        else:
+            rec = KaldiRecognizer(self.vosk_model, 16000, arg2)
+        
+        rec.SetMaxAlternatives(alts)
         rec.AcceptWaveform(audio_data.get_raw_data(convert_rate=16000, convert_width=2))
-        finalRecognition = rec.FinalResult()
+        result = rec.Result()
 
-        return finalRecognition
-
+        return result
 
 class PortableNamedTemporaryFile(object):
     """Limited replacement for ``tempfile.NamedTemporaryFile``, except unlike ``tempfile.NamedTemporaryFile``, the file can be opened again while it's currently open, even on Windows."""
