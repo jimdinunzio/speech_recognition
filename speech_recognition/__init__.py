@@ -33,6 +33,7 @@ from .exceptions import (
     TranscriptionNotReady,
     UnknownValueError,
     WaitTimeoutError,
+    ReturnAfterKeywordDetection
 )
 from typing import Sequence, Callable
 
@@ -406,6 +407,13 @@ class Recognizer(AudioSource):
                 self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)    
 
     class PorcupineListener:
+        class KeywordType:
+            """
+            Enum for keyword types.
+            """
+            LISTEN = "listen"
+            IMMEDIATE = "immediate"
+            
         class Config:
             """
             A Config is used to configure the PorcupineListener
@@ -413,22 +421,30 @@ class Recognizer(AudioSource):
             ``access_key`` is the Picovoice AccessKey obtained from the Picovoice Console (https://console.picovoice.ai/).
 
             ``keyword_paths`` is the sequence of paths to the .ppn keyword files.
-                        
+          
+            ``keyword_types`` is a sequence of strings that specifies the type for each keyword. It can be either "listen" or "immediate." Listen means listen for speech and immediate means return immediately after the keyword is detected.
+
             ``sensitivities`` is the sequence of floats from 0.0 to 1.0 for how sensitive keyword detection should be.
 
             ``on_detection`` is a callback function that is called when a keyword is detected. It takes in the index of the detected keyword as its only argument.
+
+            ``on_det_timeout`` is a callback function that is called when the listener times out waiting for speech after hearing the keyword. It takes no arguments.
             """
             def __init__(
                 self,
                 access_key: str,
                 keyword_paths: Sequence[str],
+                keyword_types: Sequence[str],
                 sensitivities: Sequence[float],
-                on_detection: Callable[[int], None] = lambda x: None
+                on_detection: Callable[[int], None] = lambda x: None,
+                on_det_timeout: Callable[[int], None] = lambda x: None
             ):
                 self.access_key = access_key
                 self.keyword_paths = keyword_paths
+                self.keyword_types = keyword_types
                 self.sensitivities = sensitivities
                 self.on_detection = on_detection
+                self.on_det_timeout = on_det_timeout
 
         def __init__(self, source, config:Config):
             import pvporcupine
@@ -441,9 +457,20 @@ class Recognizer(AudioSource):
             self.seconds_per_buffer = float(source.CHUNK) / source.SAMPLE_RATE
             self.source = source
             self.on_detection = config.on_detection
+            self.on_det_timeout = config.on_det_timeout
+            self.keyword_types=config.keyword_types
+            self.result = -1
 
         def __del__(self):
             self.listener.delete()
+
+        def on_listen_timeout(self):
+            """
+            Called when the listener times out waiting for speech after hearing the keyword.
+            """
+            self.on_det_timeout(self.result)
+            self.elapsed_time = 0
+            self.result = -1
 
         def get_prediction(self, chunk):
             self.elapsed_time += self.seconds_per_buffer
@@ -455,20 +482,20 @@ class Recognizer(AudioSource):
             The ``timeout`` parameter is the number of seconds after which waiting is aborted.
             """
             self.elapsed_time = 0
-
+            self.result = -1
             #print("listening for wake word")
             try:
                 while True:
                     if timeout and self.elapsed_time > timeout:
                         raise WaitTimeoutError("listening timed out while waiting for hotword to be said")
-                    result = self.get_prediction(self.source.stream.read(self.source.CHUNK))
-                    if result >= 0:
-                        print("Wake word #{} detected".format(result))
-                        self.on_detection(result)
+                    self.result = self.get_prediction(self.source.stream.read(self.source.CHUNK))
+                    if self.result >= 0:
+                        print("Wake word #{} detected".format(self.result))
+                        self.on_detection(self.result)
                         break
             except:
                 raise
-            return result
+            return self.result, self.keyword_types[self.result]
 
     def listen(self, source, timeout=None, phrase_time_limit=None, porcupine_config : PorcupineListener.Config=None, stream=False, is_speech_cb=None):
         """
@@ -547,8 +574,10 @@ class Recognizer(AudioSource):
                         #     time_to_print = time.monotonic()
             else:
                 # read audio input until the wake word is said
-                index = self.porcupine_listener.wait_for_hot_word(timeout)
-                if index < 0:
+                keyword_index, keyword_type = self.porcupine_listener.wait_for_hot_word(timeout)
+                if keyword_type == self.PorcupineListener.KeywordType.IMMEDIATE:
+                    raise ReturnAfterKeywordDetection(keyword_index)
+                elif keyword_index < 0:
                     raise WaitTimeoutError("listening timed out while waiting for wake word to be said")
 
             # read audio input until the phrase ends
@@ -607,7 +636,7 @@ class Recognizer(AudioSource):
                 break  # phrase is long enough or we've reached the end of the stream, so stop listening
             else:
                 if self.porcupine_listener is not None:
-                    self.porcupine_listener.on_detection(-1) # tell caller that detection was reset.
+                    self.porcupine_listener.on_listen_timeout() # tell caller that listening timed out waiting for speech.
 
         if stream:
             # yield the last buffer of the phrase.

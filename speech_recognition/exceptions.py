@@ -20,3 +20,6 @@ class TranscriptionNotReady(Exception):
 
 class TranscriptionFailed(Exception):
     pass
+
+class ReturnAfterKeywordDetection(Exception):
+    pass
