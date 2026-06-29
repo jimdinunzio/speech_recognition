@@ -22,6 +22,7 @@ import time
 import uuid
 import wave
 import struct
+import numpy
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -406,63 +407,62 @@ class Recognizer(AudioSource):
             else:
                 self.energy_threshold = self.energy_threshold * damping + target_energy * (1 - damping)    
 
-    class PorcupineListener:
+    class OpenWakeWordListener:
         class KeywordType:
             """
             Enum for keyword types.
             """
             LISTEN = "listen"
             IMMEDIATE = "immediate"
-            
+
         class Config:
             """
-            A Config is used to configure the PorcupineListener
+            A Config is used to configure the OpenWakeWordListener
 
-            ``access_key`` is the Picovoice AccessKey obtained from the Picovoice Console (https://console.picovoice.ai/).
+            ``model_paths`` is the sequence of paths to the openWakeWord model files (.onnx on Windows).
 
-            ``keyword_paths`` is the sequence of paths to the .ppn keyword files.
-          
             ``keyword_types`` is a sequence of strings that specifies the type for each keyword. It can be either "listen" or "immediate." Listen means listen for speech and immediate means return immediately after the keyword is detected.
 
-            ``sensitivities`` is the sequence of floats from 0.0 to 1.0 for how sensitive keyword detection should be.
+            ``thresholds`` is the sequence of floats from 0.0 to 1.0; a keyword is considered detected when its model score is greater than or equal to its threshold.
 
             ``on_detection`` is a callback function that is called when a keyword is detected. It takes in the index of the detected keyword as its only argument.
 
-            ``on_det_timeout`` is a callback function that is called when the listener times out waiting for speech after hearing the keyword. It takes no arguments.
+            ``on_det_timeout`` is a callback function that is called when the listener times out waiting for speech after hearing the keyword. It takes the index as its only argument.
+
+            ``inference_framework`` is the openWakeWord inference backend; on Windows only "onnx" is supported.
             """
             def __init__(
                 self,
-                access_key: str,
-                keyword_paths: Sequence[str],
+                model_paths: Sequence[str],
                 keyword_types: Sequence[str],
-                sensitivities: Sequence[float],
+                thresholds: Sequence[float],
                 on_detection: Callable[[int], None] = lambda x: None,
-                on_det_timeout: Callable[[int], None] = lambda x: None
+                on_det_timeout: Callable[[int], None] = lambda x: None,
+                inference_framework: str = "onnx"
             ):
-                self.access_key = access_key
-                self.keyword_paths = keyword_paths
+                self.model_paths = model_paths
                 self.keyword_types = keyword_types
-                self.sensitivities = sensitivities
+                self.thresholds = thresholds
                 self.on_detection = on_detection
                 self.on_det_timeout = on_det_timeout
+                self.inference_framework = inference_framework
 
         def __init__(self, source, config:Config):
-            import pvporcupine
-            self.listener = pvporcupine.create(
-                access_key=config.access_key,
-                keyword_paths=config.keyword_paths,
-                sensitivities=config.sensitivities
+            from openwakeword.model import Model
+            self.model = Model(
+                wakeword_models=list(config.model_paths),
+                inference_framework=config.inference_framework
             )
+            # openWakeWord keys each model by its file name stem; keep our config order aligned to it
+            self.model_keys = [os.path.splitext(os.path.basename(p))[0] for p in config.model_paths]
             self.elapsed_time = 0
             self.seconds_per_buffer = float(source.CHUNK) / source.SAMPLE_RATE
             self.source = source
             self.on_detection = config.on_detection
             self.on_det_timeout = config.on_det_timeout
-            self.keyword_types=config.keyword_types
+            self.keyword_types = config.keyword_types
+            self.thresholds = config.thresholds
             self.result = -1
-
-        def __del__(self):
-            self.listener.delete()
 
         def on_listen_timeout(self):
             """
@@ -474,8 +474,12 @@ class Recognizer(AudioSource):
 
         def get_prediction(self, chunk):
             self.elapsed_time += self.seconds_per_buffer
-            chunk_int16 = struct.unpack_from("h" * self.source.CHUNK, chunk) # convert bytes to int16 array
-            return self.listener.process(chunk_int16)
+            audio = numpy.frombuffer(chunk, dtype=numpy.int16) # convert bytes to int16 array
+            preds = self.model.predict(audio)
+            for i, key in enumerate(self.model_keys):
+                if preds[key] >= self.thresholds[i]:
+                    return i
+            return -1
 
         def wait_for_hot_word(self, timeout=None):
             """
@@ -492,12 +496,13 @@ class Recognizer(AudioSource):
                     if self.result >= 0:
                         print("Wake word #{} detected".format(self.result))
                         self.on_detection(self.result)
+                        self.model.reset() # clear streaming buffers so we don't immediately re-trigger
                         break
             except:
                 raise
             return self.result, self.keyword_types[self.result]
 
-    def listen(self, source, timeout=None, phrase_time_limit=None, porcupine_config : PorcupineListener.Config=None, stream=False, is_speech_cb=None):
+    def listen(self, source, timeout=None, phrase_time_limit=None, oww_config : OpenWakeWordListener.Config=None, stream=False, is_speech_cb=None):
         """
         Records a single phrase from ``source`` (an ``AudioSource`` instance) into an ``AudioData`` instance, which it returns.
 
@@ -509,27 +514,27 @@ class Recognizer(AudioSource):
 
         The ``phrase_time_limit`` parameter is the maximum number of seconds that this will allow a phrase to continue before stopping and returning the part of the phrase processed before the time limit was reached. The resulting audio will be the phrase cut off at the time limit. If ``phrase_timeout`` is ``None``, there will be no phrase time limit.
 
-        The ``porcupine_config`` parameter allows integration with `Porcupine https://picovoice.ai/docs/quick-start/porcupine-python/`, an offline, high-accuracy, power-efficient hotword recognition engine. When used, this function will pause until Porcupine detects a hotword, after which it will unpause. This parameter should either be ``None`` to turn off Porcupine support, or an instance of the class PorcupineConfig.
+        The ``oww_config`` parameter allows integration with `openWakeWord https://github.com/dscripka/openWakeWord`, an open-source, offline hotword recognition engine. When used, this function will pause until openWakeWord detects a hotword, after which it will unpause. This parameter should either be ``None`` to turn off openWakeWord support, or an instance of the class OpenWakeWordListener.Config.
 
         The ``is_speech_cb`` parameter is a function that returns whether speech is detected through some other means such as microphone array hardware
 
         This operation will always complete within ``timeout + phrase_timeout`` seconds if both are numbers, either by returning the audio data, or by raising a ``speech_recognition.WaitTimeoutError`` exception.
         """
-        result = self._listen(source, timeout, phrase_time_limit, porcupine_config, stream, is_speech_cb)
+        result = self._listen(source, timeout, phrase_time_limit, oww_config, stream, is_speech_cb)
         if not stream:
             for a in result:
                 return a
         return result
 
-    def _listen(self, source, timeout=None, phrase_time_limit=None, porcupine_config : PorcupineListener.Config=None, stream=False, is_speech_cb=None):
+    def _listen(self, source, timeout=None, phrase_time_limit=None, oww_config : OpenWakeWordListener.Config=None, stream=False, is_speech_cb=None):
         assert isinstance(source, AudioSource), "Source must be an audio source"
         assert source.stream is not None, "Audio source must be entered before listening, see documentation for ``AudioSource``; are you using ``source`` outside of a ``with`` statement?"
         assert self.pause_threshold >= self.non_speaking_duration >= 0
-        if porcupine_config is not None:
-            assert os.path.isfile(porcupine_config.keyword_paths[0]), "``porcupine_config.keyword_paths[0]`` must contain a path to a valid Porcupine keyword file"
-            self.porcupine_listener = self.PorcupineListener(source, porcupine_config)
+        if oww_config is not None:
+            assert os.path.isfile(oww_config.model_paths[0]), "``oww_config.model_paths[0]`` must contain a path to a valid openWakeWord model file"
+            self.oww_listener = self.OpenWakeWordListener(source, oww_config)
         else:
-            self.porcupine_listener = None
+            self.oww_listener = None
 
         seconds_per_buffer = float(source.CHUNK) / source.SAMPLE_RATE
         pause_buffer_count = int(math.ceil(self.pause_threshold / seconds_per_buffer))  # number of buffers of non-speaking audio during a phrase, before the phrase should be considered complete
@@ -543,7 +548,7 @@ class Recognizer(AudioSource):
         while True:
             frames = collections.deque()
 
-            if self.porcupine_listener is None:
+            if self.oww_listener is None:
                 # store audio input until the phrase starts
                 #time_to_print = time.monotonic()
                 while True:
@@ -574,8 +579,8 @@ class Recognizer(AudioSource):
                         #     time_to_print = time.monotonic()
             else:
                 # read audio input until the wake word is said
-                keyword_index, keyword_type = self.porcupine_listener.wait_for_hot_word(timeout)
-                if keyword_type == self.PorcupineListener.KeywordType.IMMEDIATE:
+                keyword_index, keyword_type = self.oww_listener.wait_for_hot_word(timeout)
+                if keyword_type == self.OpenWakeWordListener.KeywordType.IMMEDIATE:
                     raise ReturnAfterKeywordDetection(keyword_index)
                 elif keyword_index < 0:
                     raise WaitTimeoutError("listening timed out while waiting for wake word to be said")
@@ -614,7 +619,7 @@ class Recognizer(AudioSource):
                         pause_count += 1
                 
                 # wait a specified amount of time after the wake word is detected for user to continue speaking before stopping reseting
-                if self.porcupine_listener is not None and elapsed_time - phrase_start_time < self.pause_after_wake_word:
+                if self.oww_listener is not None and elapsed_time - phrase_start_time < self.pause_after_wake_word:
                     continue
 
                 if pause_count > pause_buffer_count:  # end of the phrase
@@ -635,8 +640,8 @@ class Recognizer(AudioSource):
             if phrase_count >= phrase_buffer_count or len(buffer) == 0:
                 break  # phrase is long enough or we've reached the end of the stream, so stop listening
             else:
-                if self.porcupine_listener is not None:
-                    self.porcupine_listener.on_listen_timeout() # tell caller that listening timed out waiting for speech.
+                if self.oww_listener is not None:
+                    self.oww_listener.on_listen_timeout() # tell caller that listening timed out waiting for speech.
 
         if stream:
             # yield the last buffer of the phrase.
