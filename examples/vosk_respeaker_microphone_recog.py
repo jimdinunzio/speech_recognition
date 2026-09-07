@@ -8,6 +8,11 @@ from mic_array_tuning import Tuning
 
 
 class MicArray(object):
+    # DOA reading of a source straight ahead of the robot.  The front of the
+    # array faces robot left, and DOA increases counter-clockwise, the same
+    # sense as robot yaw.
+    _DOA_FORWARD = 0
+
     def __init__(self):
         self.dev = usb.core.find(idVendor=0x2886, idProduct=0x0018)
         if not self.dev:
@@ -21,7 +26,7 @@ class MicArray(object):
         return self.tuning.is_speech()
 
     def doa2YawDelta(self, doa):
-        yawDelta = doa - 90
+        yawDelta = (doa - self._DOA_FORWARD) % 360
         if yawDelta >= 180:
             yawDelta = yawDelta - 360
         return yawDelta
