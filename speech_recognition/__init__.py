@@ -425,6 +425,8 @@ class Recognizer(AudioSource):
 
             ``thresholds`` is the sequence of floats from 0.0 to 1.0; a keyword is considered detected when its model score is greater than or equal to its threshold.
 
+            ``min_hold_seconds`` is an optional sequence of floats; a keyword is only detected once its score has stayed at or above its threshold for that many seconds. Defaults to 0 (detect on the first chunk over threshold).
+
             ``on_detection`` is a callback function that is called when a keyword is detected. It takes in the index of the detected keyword as its only argument.
 
             ``on_det_timeout`` is a callback function that is called when the listener times out waiting for speech after hearing the keyword. It takes the index as its only argument.
@@ -438,11 +440,13 @@ class Recognizer(AudioSource):
                 thresholds: Sequence[float],
                 on_detection: Callable[[int], None] = lambda x: None,
                 on_det_timeout: Callable[[int], None] = lambda x: None,
-                inference_framework: str = "onnx"
+                inference_framework: str = "onnx",
+                min_hold_seconds: Sequence[float] = None
             ):
                 self.model_paths = model_paths
                 self.keyword_types = keyword_types
                 self.thresholds = thresholds
+                self.min_hold_seconds = min_hold_seconds if min_hold_seconds is not None else [0.0] * len(model_paths)
                 self.on_detection = on_detection
                 self.on_det_timeout = on_det_timeout
                 self.inference_framework = inference_framework
@@ -462,7 +466,15 @@ class Recognizer(AudioSource):
             self.on_det_timeout = config.on_det_timeout
             self.keyword_types = config.keyword_types
             self.thresholds = config.thresholds
+            self.min_hold_seconds = config.min_hold_seconds
+            self._reset_scores()
             self.result = -1
+
+        def _reset_scores(self):
+            n = len(self.model_keys)
+            self.held = [0.0] * n   # seconds each score has stayed at or above its threshold
+            self.peak = [0.0] * n   # peak score of the current candidate, reported if it never triggers
+            self.score = 0.0        # score of the last detection
 
         def on_listen_timeout(self):
             """
@@ -477,8 +489,18 @@ class Recognizer(AudioSource):
             audio = numpy.frombuffer(chunk, dtype=numpy.int16) # convert bytes to int16 array
             preds = self.model.predict(audio)
             for i, key in enumerate(self.model_keys):
-                if preds[key] >= self.thresholds[i]:
+                score = float(preds[key])
+                threshold = self.thresholds[i]
+                self.held[i] = self.held[i] + self.seconds_per_buffer if score >= threshold else 0.0
+                if score >= threshold and self.held[i] >= self.min_hold_seconds[i]:
+                    self.score = max(score, self.peak[i])
                     return i
+                # report candidates that reach half the threshold but never trigger, for tuning
+                if score >= threshold * 0.5:
+                    self.peak[i] = max(self.peak[i], score)
+                elif self.peak[i] > 0.0:
+                    print("Wake word #{} rejected: peak score {:.2f} (threshold {:.2f})".format(i, self.peak[i], threshold))
+                    self.peak[i] = 0.0
             return -1
 
         def wait_for_hot_word(self, timeout=None):
@@ -487,6 +509,7 @@ class Recognizer(AudioSource):
             """
             self.elapsed_time = 0
             self.result = -1
+            self._reset_scores()
             #print("listening for wake word")
             try:
                 while True:
@@ -494,7 +517,7 @@ class Recognizer(AudioSource):
                         raise WaitTimeoutError("listening timed out while waiting for hotword to be said")
                     self.result = self.get_prediction(self.source.stream.read(self.source.CHUNK))
                     if self.result >= 0:
-                        print("Wake word #{} detected".format(self.result))
+                        print("Wake word #{} detected (score {:.2f})".format(self.result, self.score))
                         self.on_detection(self.result)
                         self.model.reset() # clear streaming buffers so we don't immediately re-trigger
                         break
